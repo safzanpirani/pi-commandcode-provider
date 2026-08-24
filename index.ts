@@ -100,6 +100,15 @@ const MODELS: ModelDef[] = [
 		maxTokens: 131072,
 		cost: ZERO_COST,
 	},
+	{
+		id: "poolside/laguna-s-2.1-free",
+		name: "Laguna S 2.1 Free (Command Code)",
+		reasoning: false,
+		input: ["text"],
+		contextWindow: 256_000,
+		maxTokens: 32768,
+		cost: ZERO_COST,
+	},
 	// Moonshot Kimi
 	{
 		id: "moonshotai/Kimi-K3",
@@ -538,7 +547,9 @@ function streamCommandCode(
 				permissionMode: "standard",
 				params: {
 					model: model.id,
-					system: context.systemPrompt ?? "",
+					system: Array.isArray(context.systemPrompt)
+						? context.systemPrompt.join("\n\n")
+						: (context.systemPrompt ?? ""),
 					messages: convertMessages(context.messages),
 					tools,
 					max_tokens: options?.maxTokens ?? model.maxTokens ?? 8192,
