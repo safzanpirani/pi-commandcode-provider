@@ -38,11 +38,12 @@
     ]
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsrs --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",
+    "tsrs": "0.16.0-ts7.1.0-dev.20260929",
     "typescript": "^5.9.2"
   }
 }
