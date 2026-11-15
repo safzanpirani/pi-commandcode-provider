@@ -118,3 +118,84 @@ test("CMD_ZDR enables the strict zero-retention header", async (t) => {
 	assert.equal(zdrHeader, "1");
 	assert.equal(events.at(-1)?.type, "done");
 });
+
+test("interrupted tool call gets a synthetic result so the request stays valid", async (t) => {
+	let sent;
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		sent = JSON.parse(init.body);
+		return new Response('{"type":"finish","finishReason":"stop","totalUsage":{"totalTokens":0}}\n', {
+			status: 200,
+			headers: { "content-type": "application/x-ndjson" },
+		});
+	});
+
+	// Reproduces a transcript pi leaves behind after Stop/Esc: the assistant
+	// message carries a toolCall whose toolResult was never persisted. The
+	// gateway rejects such a request with
+	// "Tool result is missing for tool call call_00_...".
+	const interrupted = {
+		role: "assistant",
+		content: [
+			{ type: "text", text: "Checking the device node." },
+			{ type: "toolCall", id: "call_00_kXURtf48dOOoBPfBvdaE0811", name: "bash", arguments: {} },
+		],
+	};
+	const followUp = { role: "user", content: [{ type: "text", text: "continue" }] };
+	const trailing = { role: "assistant", content: [{ type: "toolCall", id: "call_orphan_tail", name: "bash", arguments: {} }] };
+
+	const stream = provider.streamSimple(
+		model,
+		{ systemPrompt: "", messages: [interrupted, followUp, trailing], tools: [] },
+		{ apiKey: "user_test" },
+	);
+	for await (const event of stream) void event;
+
+	const messages = sent.params.messages;
+	const callIDs = messages
+		.flatMap((m) => (m.role === "assistant" ? m.content : []))
+		.filter((b) => b.type === "tool-call")
+		.map((b) => b.toolCallId);
+	const resultIDs = messages
+		.flatMap((m) => (m.role === "tool" ? m.content : []))
+		.filter((b) => b.type === "tool-result")
+		.map((b) => b.toolCallId);
+
+	// Every tool-call in the transcript must be answered by a tool-result,
+	// including the trailing one at the very end of the conversation.
+	assert.deepEqual(callIDs, ["call_00_kXURtf48dOOoBPfBvdaE0811", "call_orphan_tail"]);
+	assert.deepEqual(resultIDs, callIDs);
+	for (const m of messages.filter((m) => m.role === "tool")) {
+		for (const b of m.content) assert.match(b.output.value, /interrupted/i);
+	}
+});
+
+test("answered tool calls are left untouched (no synthetic results)", async (t) => {
+	let sent;
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		sent = JSON.parse(init.body);
+		return new Response('{"type":"finish","finishReason":"stop","totalUsage":{"totalTokens":0}}\n', {
+			status: 200,
+			headers: { "content-type": "application/x-ndjson" },
+		});
+	});
+
+	const messages = [
+		{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } }] },
+		{
+			role: "toolResult",
+			toolCallId: "call_1",
+			toolName: "bash",
+			content: [{ type: "text", text: "file.txt" }],
+			isError: false,
+		},
+		{ role: "user", content: [{ type: "text", text: "thanks" }] },
+	];
+
+	const stream = provider.streamSimple(model, { systemPrompt: "", messages, tools: [] }, { apiKey: "user_test" });
+	for await (const event of stream) void event;
+
+	const toolMsgs = sent.params.messages.filter((m) => m.role === "tool");
+	assert.equal(toolMsgs.length, 1);
+	assert.equal(toolMsgs[0].content.length, 1);
+	assert.equal(toolMsgs[0].content[0].output.value, "file.txt");
+});

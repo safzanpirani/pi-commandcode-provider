@@ -376,8 +376,44 @@ function convertMessages(messages: Message[]): CmdMessage[] {
 	// Track tool call names by id so tool-result messages can fill `toolName`
 	const toolNameById = new Map<string, string>();
 
+	// Tool calls from the most recent assistant message that no tool-result has
+	// answered yet. The gateway validates the Vercel AI SDK `ModelMessage[]`
+	// schema and rejects a transcript whose tool-call lacks a matching
+	// tool-result with "Tool result is missing for tool call <id>" — every retry
+	// then fails identically, permanently wedging the session. pi leaves exactly
+	// such calls behind when a tool run is interrupted (Stop/Esc) or a turn is
+	// aborted: the assistant message with the toolCall is persisted, its result
+	// never is. Any call still unanswered when the next message arrives — or when
+	// the transcript ends — gets a synthetic result so the request stays valid.
+	let pending: { id: string; name: string }[] = [];
+
+	const pushToolResults = (blocks: ToolContent[]) => {
+		if (blocks.length === 0) return;
+		// Merge consecutive tool-result messages into one role:"tool" message
+		const last = out[out.length - 1];
+		if (last && last.role === "tool") last.content.push(...blocks);
+		else out.push({ role: "tool", content: blocks });
+	};
+
+	const flushPending = () => {
+		if (pending.length === 0) return;
+		const blocks: ToolContent[] = pending.map(({ id, name }) => ({
+			type: "tool-result",
+			toolCallId: id,
+			toolName: name,
+			output: {
+				type: "text",
+				value:
+					"[tool call interrupted] No result was recorded for this call — the run was stopped before it finished. Do not assume it succeeded.",
+			},
+		}));
+		pending = [];
+		pushToolResults(blocks);
+	};
+
 	for (const msg of messages) {
 		if (msg.role === "user") {
+			flushPending();
 			const content: UserContent[] = [];
 			if (typeof msg.content === "string") {
 				content.push({ type: "text", text: msg.content });
@@ -394,12 +430,15 @@ function convertMessages(messages: Message[]): CmdMessage[] {
 			}
 			if (content.length > 0) out.push({ role: "user", content });
 		} else if (msg.role === "assistant") {
+			flushPending();
 			const content: AssistantContent[] = [];
+			const calls: { id: string; name: string }[] = [];
 			for (const block of msg.content) {
 				if (block.type === "text") {
 					if (block.text) content.push({ type: "text", text: block.text });
 				} else if (block.type === "toolCall") {
 					toolNameById.set(block.id, block.name);
+					calls.push({ id: block.id, name: block.name });
 					content.push({
 						type: "tool-call",
 						toolCallId: block.id,
@@ -409,7 +448,10 @@ function convertMessages(messages: Message[]): CmdMessage[] {
 				}
 				// Skip "thinking" — the upstream provider reconstructs its own reasoning
 			}
-			if (content.length > 0) out.push({ role: "assistant", content });
+			if (content.length > 0) {
+				out.push({ role: "assistant", content });
+				pending = calls;
+			}
 		} else if (msg.role === "toolResult") {
 			const text = msg.content
 				.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -421,15 +463,12 @@ function convertMessages(messages: Message[]): CmdMessage[] {
 				toolName: toolNameById.get(msg.toolCallId) ?? msg.toolName ?? "unknown",
 				output: { type: msg.isError ? "error-text" : "text", value: text },
 			};
-			// Merge consecutive tool-result messages into one role:"tool" message
-			const last = out[out.length - 1];
-			if (last && last.role === "tool") {
-				last.content.push(block);
-			} else {
-				out.push({ role: "tool", content: [block] });
-			}
+			pending = pending.filter((call) => call.id !== msg.toolCallId);
+			pushToolResults([block]);
 		}
 	}
+	// Trailing interrupted call at the end of the transcript.
+	flushPending();
 	return out;
 }
 
